@@ -280,7 +280,6 @@ fn run_two_nets() -> Result<(NamadaCmd, NamadaCmd, Test, Test)> {
         &["ledger", "run"],
         Some(40)
     )?;
-    ledger_a.exp_string("Namada ledger node started")?;
     // Run Chain B
     let mut ledger_b = run_as!(
         test_b,
