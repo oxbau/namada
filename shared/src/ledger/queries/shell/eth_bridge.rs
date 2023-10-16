@@ -1,10 +1,11 @@
 //! Ethereum bridge related shell queries.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use namada_core::hints;
 use namada_core::ledger::eth_bridge::storage::bridge_pool::get_key_from_hash;
 use namada_core::ledger::storage::merkle_tree::StoreRef;
 use namada_core::ledger::storage::{DBIter, StorageHasher, StoreType, DB};
@@ -36,12 +37,40 @@ use namada_ethereum_bridge::storage::{
 use namada_proof_of_stake::pos_queries::PosQueries;
 
 use crate::eth_bridge::ethers::abi::AbiDecode;
+use crate::ledger::queries::shell::EventType;
 use crate::ledger::queries::{EncodedResponseQuery, RequestCtx, RequestQuery};
 use crate::types::eth_abi::{Encode, EncodeCell};
 use crate::types::eth_bridge_pool::PendingTransfer;
 use crate::types::keccak::KeccakHash;
 use crate::types::storage::Epoch;
 use crate::types::storage::MembershipProof::BridgePool;
+
+/// Container for the status of queried transfers to Ethereum.
+///
+/// If a transfer hash is not featured in a response, it is
+/// because it was either relayed to Ethereum, or because it
+/// expired from the Bridge pool, but its hash was not present
+/// in Namada's event log.
+#[derive(
+    Default, Debug, Clone, Eq, PartialEq, BorshSerialize, BorshDeserialize,
+)]
+pub struct TransferToEthereumStatus {
+    /// The block height at which the query was performed.
+    ///
+    /// This value may be used to busy wait while a Bridge pool
+    /// proof is being constructed for it, such that clients can
+    /// safely perform additional actions.
+    pub queried_height: BlockHeight,
+    /// Transfers in the query whose status it was determined
+    /// to be `pending`.
+    pub pending: HashSet<KeccakHash>,
+    /// Transfers in the query whose status it was determined
+    /// to be `relayed`.
+    pub relayed: HashSet<KeccakHash>,
+    /// Transfers in the query whose status it was determined
+    /// to be `expired`.
+    pub expired: HashSet<KeccakHash>,
+}
 
 /// Contains information about the flow control of some ERC20
 /// wrapped asset.
@@ -119,6 +148,11 @@ router! {ETH_BRIDGE,
         -> HashMap<PendingTransfer, FractionalVotingPower>
         = transfer_to_ethereum_progress,
 
+    // Given a list of keccak hashes, check whether they have been
+    // relayed, expired or if they are still pending.
+    ( "pool" / "transfer_status" )
+        -> TransferToEthereumStatus = (with_options pending_eth_transfer_status),
+
     // Request a proof of a validator set signed off for
     // the given epoch.
     //
@@ -163,6 +197,92 @@ router! {ETH_BRIDGE,
     // ERC20 token in Namada.
     ( "erc20" / "flow_control" / [asset: EthAddress] )
         -> Erc20FlowControl = get_erc20_flow_control,
+}
+
+/// Given a list of keccak hashes, check whether they have been
+/// relayed, expired or if they are still pending.
+fn pending_eth_transfer_status<D, H>(
+    ctx: RequestCtx<'_, D, H>,
+    request: &RequestQuery,
+) -> storage_api::Result<EncodedResponseQuery>
+where
+    D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
+    H: 'static + StorageHasher + Sync,
+{
+    let mut status = TransferToEthereumStatus {
+        queried_height: ctx.wl_storage.storage.get_last_block_height(),
+        ..Default::default()
+    };
+
+    let transfer_hashes: HashSet<KeccakHash> =
+        BorshDeserialize::try_from_slice(request.data.as_slice())
+            .into_storage_result()?;
+
+    // check which transfers in the Bridge pool match the requested hashes
+    let merkle_tree = ctx
+        .wl_storage
+        .storage
+        .get_merkle_tree(ctx.wl_storage.storage.get_last_block_height())
+        .expect("We should always be able to read the database");
+    let stores = merkle_tree.stores();
+    let store = match stores.store(&StoreType::BridgePool) {
+        StoreRef::BridgePool(store) => store,
+        _ => unreachable!(),
+    };
+    if hints::likely(store.len() > transfer_hashes.len()) {
+        for hash in transfer_hashes.iter() {
+            if store.contains_key(hash) {
+                status.pending.insert(hash.clone());
+            }
+        }
+    } else {
+        for hash in store.keys() {
+            if transfer_hashes.contains(hash) {
+                status.pending.insert(hash.clone());
+            }
+        }
+    }
+
+    // INVARIANT: transfers that are in the event log will have already
+    // been processed and therefore removed from the Bridge pool at the
+    // time of this query
+    let kind_key: String = "kind".into();
+    let completed_transfers = ctx.event_log.iter().filter_map(|ev| {
+        if !matches!(&ev.event_type, EventType::EthereumBridge) {
+            return None;
+        }
+        let eth_event_kind =
+            ev.attributes.get(&kind_key).map(|k| k.as_str())?;
+        let is_relayed = match eth_event_kind {
+            "bridge_pool_relayed" => true,
+            "bridge_pool_expired" => false,
+            _ => return None,
+        };
+        let tx_hash: KeccakHash = ev
+            .attributes
+            .get("tx_hash")
+            .expect("The transfer hash must be available")
+            .as_str()
+            .try_into()
+            .expect("We must have a valid KeccakHash");
+        if !transfer_hashes.contains(&tx_hash) {
+            return None;
+        }
+        Some((tx_hash, is_relayed))
+    });
+    for (hash, is_relayed) in completed_transfers {
+        if hints::likely(is_relayed) {
+            status.relayed.insert(hash.clone());
+        } else {
+            status.expired.insert(hash.clone());
+        }
+    }
+
+    let data = status.try_to_vec().into_storage_result()?;
+    Ok(EncodedResponseQuery {
+        data,
+        ..Default::default()
+    })
 }
 
 /// Read the total supply and respective cap of some wrapped
