@@ -8,6 +8,7 @@ use std::ops::{Index, IndexMut};
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use namada_core::types::ethereum_structs::{BpTransferStatus, EthBridgeEvent};
 use serde_json::Value;
 
 use crate::ledger::governance::utils::ProposalEvent;
@@ -16,6 +17,37 @@ use crate::tendermint_proto::abci::EventAttribute;
 use crate::types::ibc::IbcEvent;
 #[cfg(feature = "ferveo-tpke")]
 use crate::types::transaction::TxType;
+
+impl From<EthBridgeEvent> for Event {
+    #[inline]
+    fn from(event: EthBridgeEvent) -> Event {
+        Self::from(&event)
+    }
+}
+
+impl From<&EthBridgeEvent> for Event {
+    fn from(event: &EthBridgeEvent) -> Event {
+        match event {
+            EthBridgeEvent::BridgePool { tx_hash, status } => Event {
+                event_type: EventType::EthereumBridge,
+                level: EventLevel::Tx,
+                attributes: {
+                    let mut attrs = HashMap::new();
+                    attrs.insert(
+                        "kind".into(),
+                        match status {
+                            BpTransferStatus::Relayed => "bridge_pool_relayed",
+                            BpTransferStatus::Expired => "bridge_pool_expired",
+                        }
+                        .into(),
+                    );
+                    attrs.insert("tx_hash".into(), tx_hash.to_string());
+                    attrs
+                },
+            },
+        }
+    }
+}
 
 /// Indicates if an event is emitted do to
 /// an individual Tx or the nature of a finalized block
@@ -53,6 +85,8 @@ pub enum EventType {
     Proposal,
     /// The pgf payment
     PgfPayment,
+    /// Ethereum Bridge event
+    EthereumBridge,
 }
 
 impl Display for EventType {
@@ -63,6 +97,7 @@ impl Display for EventType {
             EventType::Ibc(t) => write!(f, "{}", t),
             EventType::Proposal => write!(f, "proposal"),
             EventType::PgfPayment => write!(f, "pgf_payment"),
+            EventType::EthereumBridge => write!(f, "ethereum_bridge"),
         }?;
         Ok(())
     }
@@ -83,6 +118,7 @@ impl FromStr for EventType {
             "write_acknowledgement" => {
                 Ok(EventType::Ibc("write_acknowledgement".to_string()))
             }
+            "ethereum_bridge" => Ok(EventType::EthereumBridge),
             _ => Err(EventError::InvalidEventType),
         }
     }
