@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use borsh::BorshSerialize;
@@ -18,11 +18,11 @@ use super::{block_on_eth_sync, eth_sync_or_exit, BlockOnEthSync};
 use crate::eth_bridge::ethers::abi::AbiDecode;
 use crate::ledger::queries::{
     Client, GenBridgePoolProofReq, GenBridgePoolProofRsp, TransferToErcArgs,
-    RPC,
+    TransferToEthereumStatus, RPC,
 };
 use crate::proto::Tx;
 use crate::sdk::args;
-use crate::sdk::error::Error;
+use crate::sdk::error::{Error, QueryError};
 use crate::sdk::masp::{ShieldedContext, ShieldedUtils};
 use crate::sdk::rpc::{query_wasm_code_hash, validate_amount};
 use crate::sdk::tx::prepare_tx;
@@ -461,6 +461,38 @@ where
 
     display_line!(IO, "{transf_result:?}");
     control_flow::proceed(())
+}
+
+/// Query the status of a set of transfers to Ethreum, indexed
+/// by their keccak hash.
+///
+/// If the response to the query omits any of the given transfer
+/// hashes, it is because the transfer has either been successfully
+/// relayed or it has expired from the Bridge pool, but it is no
+/// longer present in Namada's event log.
+///
+/// The event itself should still be queriable from CometBFT, but
+/// it may require a large number of RPC calls before the block
+/// containing the desired transfer is found.
+pub async fn query_eth_transfer_status<C, T>(
+    client: &C,
+    transfers: T,
+) -> Result<TransferToEthereumStatus, Error>
+where
+    C: Client + Sync,
+    T: Into<HashSet<KeccakHash>>,
+{
+    RPC.shell()
+        .eth_bridge()
+        .pending_eth_transfer_status(
+            client,
+            Some(transfers.into().try_to_vec().unwrap()),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| Error::Query(QueryError::General(e.to_string())))
+        .map(|result| result.data)
 }
 
 mod recommendations {
