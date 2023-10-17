@@ -209,14 +209,18 @@ where
     D: 'static + DB + for<'iter> DBIter<'iter> + Sync,
     H: 'static + StorageHasher + Sync,
 {
+    let mut transfer_hashes: HashSet<KeccakHash> =
+        BorshDeserialize::try_from_slice(request.data.as_slice())
+            .into_storage_result()?;
+
+    if transfer_hashes.is_empty() {
+        return Ok(Default::default());
+    }
+
     let mut status = TransferToEthereumStatus {
         queried_height: ctx.wl_storage.storage.get_last_block_height(),
         ..Default::default()
     };
-
-    let transfer_hashes: HashSet<KeccakHash> =
-        BorshDeserialize::try_from_slice(request.data.as_slice())
-            .into_storage_result()?;
 
     // check which transfers in the Bridge pool match the requested hashes
     let merkle_tree = ctx
@@ -230,17 +234,30 @@ where
         _ => unreachable!(),
     };
     if hints::likely(store.len() > transfer_hashes.len()) {
-        for hash in transfer_hashes.iter() {
-            if store.contains_key(hash) {
+        transfer_hashes.retain(|hash| {
+            let transfer_in_pool = store.contains_key(hash);
+            if transfer_in_pool {
                 status.pending.insert(hash.clone());
             }
-        }
+            !transfer_in_pool
+        });
     } else {
         for hash in store.keys() {
-            if transfer_hashes.contains(hash) {
+            if transfer_hashes.remove(hash) {
                 status.pending.insert(hash.clone());
             }
+            if transfer_hashes.is_empty() {
+                break;
+            }
         }
+    }
+
+    if transfer_hashes.is_empty() {
+        let data = status.try_to_vec().into_storage_result()?;
+        return Ok(EncodedResponseQuery {
+            data,
+            ..Default::default()
+        });
     }
 
     // INVARIANT: transfers that are in the event log will have already
@@ -265,16 +282,19 @@ where
             .as_str()
             .try_into()
             .expect("We must have a valid KeccakHash");
-        if !transfer_hashes.contains(&tx_hash) {
+        if !transfer_hashes.remove(&tx_hash) {
             return None;
         }
-        Some((tx_hash, is_relayed))
+        Some((tx_hash, is_relayed, transfer_hashes.is_empty()))
     });
-    for (hash, is_relayed) in completed_transfers {
+    for (hash, is_relayed, early_exit) in completed_transfers {
         if hints::likely(is_relayed) {
             status.relayed.insert(hash.clone());
         } else {
             status.expired.insert(hash.clone());
+        }
+        if early_exit {
+            break;
         }
     }
 
