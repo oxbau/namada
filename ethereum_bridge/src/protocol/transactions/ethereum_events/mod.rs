@@ -12,6 +12,7 @@ use namada_core::ledger::storage::traits::StorageHasher;
 use namada_core::ledger::storage::{DBIter, WlStorage, DB};
 use namada_core::types::address::Address;
 use namada_core::types::ethereum_events::EthereumEvent;
+use namada_core::types::ethereum_structs::EthBridgeEvent;
 use namada_core::types::internal::ExpiredTx;
 use namada_core::types::storage::{BlockHeight, Epoch, Key};
 use namada_core::types::token::Amount;
@@ -67,14 +68,17 @@ where
 
     let voting_powers = utils::get_voting_powers(wl_storage, &updates)?;
 
+    let mut eth_bridge_events = BTreeSet::new();
     changed_keys.append(&mut apply_updates(
         wl_storage,
+        &mut eth_bridge_events,
         updates,
         voting_powers,
     )?);
 
     Ok(TxResult {
         changed_keys,
+        eth_bridge_events,
         ..Default::default()
     })
 }
@@ -86,6 +90,7 @@ where
 /// `(Address, BlockHeight)`s that occur in any of the `updates`.
 pub(super) fn apply_updates<D, H>(
     wl_storage: &mut WlStorage<D, H>,
+    tx_events: &mut BTreeSet<EthBridgeEvent>,
     updates: HashSet<EthMsgUpdate>,
     voting_powers: HashMap<(Address, BlockHeight), Amount>,
 ) -> Result<ChangedKeys>
@@ -120,7 +125,7 @@ where
     // Right now, the order in which events are acted on does not matter.
     // For `TransfersToNamada` events, they can happen in any order.
     for event in confirmed {
-        let mut changed = events::act_on(wl_storage, event)?;
+        let mut changed = events::act_on(wl_storage, tx_events, event)?;
         changed_keys.append(&mut changed);
     }
     Ok(changed_keys)
@@ -356,8 +361,12 @@ mod tests {
             )],
         );
 
-        let changed_keys =
-            apply_updates(&mut wl_storage, updates, voting_powers)?;
+        let changed_keys = apply_updates(
+            &mut wl_storage,
+            &mut BTreeSet::new(),
+            updates,
+            voting_powers,
+        )?;
 
         let eth_msg_keys: vote_tallies::Keys<EthereumEvent> = (&body).into();
         let wrapped_erc20_token = wrapped_erc20s::token(&asset);

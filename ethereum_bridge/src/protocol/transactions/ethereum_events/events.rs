@@ -18,6 +18,7 @@ use namada_core::ledger::storage::traits::StorageHasher;
 use namada_core::ledger::storage::{DBIter, WlStorage, DB};
 use namada_core::ledger::storage_api::{StorageRead, StorageWrite};
 use namada_core::types::address::Address;
+use namada_core::types::eth_abi::Encode;
 use namada_core::types::eth_bridge_pool::{
     PendingTransfer, TransferToEthereumKind,
 };
@@ -25,6 +26,7 @@ use namada_core::types::ethereum_events::{
     EthAddress, EthereumEvent, TransferToEthereum, TransferToNamada,
     TransfersToNamada,
 };
+use namada_core::types::ethereum_structs::EthBridgeEvent;
 use namada_core::types::storage::{BlockHeight, Key, KeySeg};
 use namada_core::types::token;
 use namada_core::types::token::{balance_key, minted_balance_key};
@@ -38,6 +40,7 @@ use crate::storage::eth_bridge_queries::{EthAssetMint, EthBridgeQueries};
 /// transferred assets to the appropriate receiver addresses.
 pub(super) fn act_on<D, H>(
     wl_storage: &mut WlStorage<D, H>,
+    tx_events: &mut BTreeSet<EthBridgeEvent>,
     event: EthereumEvent,
 ) -> Result<BTreeSet<Key>>
 where
@@ -55,7 +58,7 @@ where
             ref transfers,
             ref relayer,
             ..
-        } => act_on_transfers_to_eth(wl_storage, transfers, relayer),
+        } => act_on_transfers_to_eth(wl_storage, tx_events, transfers, relayer),
         _ => {
             tracing::debug!(?event, "No actions taken for Ethereum event");
             Ok(BTreeSet::default())
@@ -299,6 +302,7 @@ where
 
 fn act_on_transfers_to_eth<D, H>(
     wl_storage: &mut WlStorage<D, H>,
+    tx_events: &mut BTreeSet<EthBridgeEvent>,
     transfers: &[TransferToEthereum],
     relayer: &Address,
 ) -> Result<BTreeSet<Key>>
@@ -363,6 +367,9 @@ where
         _ = changed_keys.insert(key);
         _ = changed_keys.insert(pool_balance_key);
         _ = changed_keys.insert(relayer_rewards_key);
+        _ = tx_events.insert(EthBridgeEvent::new_bridge_pool_relayed(
+            pending_transfer.keccak256(),
+        ));
     }
 
     if pending_keys.is_empty() {
@@ -383,7 +390,7 @@ where
             )
             .expect("BlockHeight should be decoded");
             if inserted_height <= timeout_height {
-                let mut keys = refund_transfer(wl_storage, key)?;
+                let mut keys = refund_transfer(wl_storage, tx_events, key)?;
                 changed_keys.append(&mut keys);
             }
         }
@@ -411,6 +418,7 @@ where
 
 fn refund_transfer<D, H>(
     wl_storage: &mut WlStorage<D, H>,
+    tx_events: &mut BTreeSet<EthBridgeEvent>,
     key: Key,
 ) -> Result<BTreeSet<Key>>
 where
@@ -429,6 +437,11 @@ where
     // Delete the key from the bridge pool
     wl_storage.delete(&key)?;
     _ = changed_keys.insert(key);
+
+    // Emit expiration event
+    _ = tx_events.insert(EthBridgeEvent::new_bridge_pool_expired(
+        transfer.keccak256(),
+    ));
 
     Ok(changed_keys)
 }
@@ -818,7 +831,8 @@ mod tests {
         }];
 
         for event in events {
-            act_on(&mut wl_storage, event.clone()).unwrap();
+            act_on(&mut wl_storage, &mut BTreeSet::new(), event.clone())
+                .unwrap();
             assert_eq!(
                 stored_keys_count(&wl_storage),
                 initial_stored_keys_count,
@@ -848,7 +862,7 @@ mod tests {
             transfers,
         };
 
-        act_on(&mut wl_storage, event).unwrap();
+        act_on(&mut wl_storage, &mut BTreeSet::new(), event).unwrap();
 
         assert_eq!(
             stored_keys_count(&wl_storage),
@@ -1049,7 +1063,8 @@ mod tests {
                 .expect("Test failed"),
         )
         .expect("Test failed");
-        let mut changed_keys = act_on(&mut wl_storage, event).unwrap();
+        let mut changed_keys =
+            act_on(&mut wl_storage, &mut BTreeSet::new(), event).unwrap();
 
         for erc20 in [
             random_erc20_token,
@@ -1176,7 +1191,7 @@ mod tests {
             transfers: vec![],
             relayer: gen_implicit_address(),
         };
-        let _ = act_on(&mut wl_storage, event).unwrap();
+        let _ = act_on(&mut wl_storage, &mut BTreeSet::new(), event).unwrap();
 
         // The latest transfer is still pending
         let prefix = BRIDGE_POOL_ADDRESS.to_db_key().into();
@@ -1444,7 +1459,7 @@ mod tests {
                 )
                 .collect::<Vec<_>>();
 
-            _ = act_on(wl_storage, event).unwrap();
+            _ = act_on(wl_storage, &mut BTreeSet::new(), event).unwrap();
 
             for Delta {
                 kind,
@@ -1519,7 +1534,7 @@ mod tests {
                 .expect("Read must succeed")
                 .expect("Balance must exist");
 
-            _ = act_on(wl_storage, event).unwrap();
+            _ = act_on(wl_storage, &mut BTreeSet::new(), event).unwrap();
 
             // check post supply - the wNAM minted supply should increase
             // by the transferred amount
