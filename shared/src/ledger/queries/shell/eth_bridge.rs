@@ -35,6 +35,7 @@ use namada_ethereum_bridge::storage::{
     bridge_contract_key, native_erc20_key, vote_tallies,
 };
 use namada_proof_of_stake::pos_queries::PosQueries;
+use serde::{Deserialize, Serialize};
 
 use crate::eth_bridge::ethers::abi::AbiDecode;
 use crate::ledger::queries::shell::EventType;
@@ -52,7 +53,15 @@ use crate::types::storage::MembershipProof::BridgePool;
 /// expired from the Bridge pool, but its hash was not present
 /// in Namada's event log.
 #[derive(
-    Default, Debug, Clone, Eq, PartialEq, BorshSerialize, BorshDeserialize,
+    Default,
+    Debug,
+    Clone,
+    Eq,
+    PartialEq,
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
 )]
 pub struct TransferToEthereumStatus {
     /// The block height at which the query was performed.
